@@ -25,9 +25,12 @@ export async function xlsxBufferToText(buf: ArrayBuffer): Promise<string> {
     out.push(`# Sheet: ${name}`);
     const ws = wb.Sheets[name];
     const rows = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, blankrows: false });
-    const headers = (rows[0] ?? []).map((cell) => String(cell ?? "").trim().toLowerCase());
+    const headers = (rows[0] ?? []).map((cell) => String(cell ?? "").trim());
     rows.forEach((row, index) => {
-      const cells = row.map((cell, columnIndex) => formatSpreadsheetCell(cell, headers[columnIndex], row)).join(" | ");
+      const cells = row
+        .map((cell, columnIndex) => formatSpreadsheetCell(cell, headers[columnIndex], row))
+        .filter(Boolean)
+        .join(" | ");
       out.push(`Sheet ${name} row ${index + 1}: ${cells}`);
     });
   }
@@ -36,21 +39,25 @@ export async function xlsxBufferToText(buf: ArrayBuffer): Promise<string> {
 
 function formatSpreadsheetCell(cell: unknown, header: string | undefined, row: unknown[]): string {
   if (cell == null) return "";
-  if (typeof cell !== "number" || !isFinite(cell)) return String(cell).trim();
+  const label = String(header ?? "").trim();
+  const prefix = label ? `${label}=` : "";
+  if (typeof cell !== "number" || !isFinite(cell)) return `${prefix}${String(cell).trim()}`;
 
   const rowLabel = row
     .slice(0, 2)
     .map((value) => String(value ?? "").toLowerCase())
     .join(" ");
-  const financialContext = [header ?? "", rowLabel].join(" ");
+  const financialContext = [label.toLowerCase(), rowLabel].join(" ");
+  const looksLikePercent = /\b(occupancy|occupanc|occ\.?|percent|pct|%)\b/.test(financialContext) && Math.abs(cell) <= 1;
 
   const looksLikeMoney =
     /\b(amount|budget|cost|price|value|loan|equity|debt|proceeds|income|revenue|rent|noi|opex|expense|tdc|total|contingency|financing|acquisition|land|soft|hard|capital|reserve|fee)\b/.test(
       financialContext,
-    ) && Math.abs(cell) >= 1000;
+    );
 
   const formatted = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(cell);
-  return looksLikeMoney ? `$${formatted}` : formatted;
+  if (looksLikePercent) return `${prefix}${(cell * 100).toFixed(2)}%`;
+  return `${prefix}${looksLikeMoney ? `$${formatted}` : formatted}`;
 }
 
 // Best-effort DOCX text extraction using only Node built-ins. A .docx is a ZIP

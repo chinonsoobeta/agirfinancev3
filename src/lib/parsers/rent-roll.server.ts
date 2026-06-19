@@ -22,10 +22,17 @@ export function parseRentRollWorkbook(buffer: ArrayBuffer) {
   const rejected: { row: number; reason: string; values: unknown[] }[] = [];
 
   const header = rows[0]?.map((cell) => String(cell ?? "").toLowerCase()) ?? [];
-  const typeIndex = Math.max(0, header.findIndex((h) => /unit type|type|plan|component/.test(h)));
-  const countIndex = Math.max(1, header.findIndex((h) => /count|units|qty/.test(h)));
+  const foundTypeIndex = header.findIndex((h) => /unit type|type|plan|component/.test(h));
+  const foundCountIndex = header.findIndex((h) => /count|units|qty/.test(h));
+  const foundRentIndex = header.findIndex((h) => /rent|rate/.test(h));
+  if (foundTypeIndex < 0 || foundCountIndex < 0 || foundRentIndex < 0) {
+    return { inserted, rejected };
+  }
+  const typeIndex = foundTypeIndex;
+  const countIndex = foundCountIndex;
   const sfIndex = header.findIndex((h) => /sf|square/.test(h));
-  const rentIndex = Math.max(2, header.findIndex((h) => /rent|rate/.test(h)));
+  const rentIndex = foundRentIndex;
+  const rentBasisIndex = header.findIndex((h) => /basis|rent basis|billing/.test(h));
   const occupancyIndex = header.findIndex((h) => /occupanc|occ\.?\s|occ%|occ$/.test(h));
   const rentHeader = header[rentIndex] ?? "";
   const perSfRent = /psf|\/\s?sf|per\s?sf|per\s?square/.test(rentHeader);
@@ -48,7 +55,11 @@ export function parseRentRollWorkbook(buffer: ArrayBuffer) {
       rejected.push({ row: rowNumber, reason: "Missing unit type, count, or rent.", values: row });
       return;
     }
-    const rentBasis: ParsedRentRollRow["rentBasis"] = perSfRent && avgSf ? "per_sf" : "per_unit";
+    const basisText = rentBasisIndex >= 0 ? String(row[rentBasisIndex] ?? "").toLowerCase() : "";
+    const rentBasis: ParsedRentRollRow["rentBasis"] =
+      /per[_\s-]*sf|psf|square/.test(basisText) ? "per_sf"
+      : /per[_\s-]*unit|unit|month|mo/.test(basisText) ? "per_unit"
+      : perSfRent && avgSf ? "per_sf" : "per_unit";
     inserted.push({
       unitType,
       unitCount: rentBasis === "per_sf" && unitCount <= 0 ? 1 : unitCount,
@@ -56,7 +67,7 @@ export function parseRentRollWorkbook(buffer: ArrayBuffer) {
       rent,
       rentBasis,
       occupancyPct,
-      sourceCellRef: `${XLSX.utils.encode_col(rentIndex)}${rowNumber}`,
+      sourceCellRef: `Sheet ${workbook.SheetNames[0]} row ${rowNumber}`,
     });
   });
 

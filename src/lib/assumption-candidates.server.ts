@@ -109,18 +109,27 @@ export function extractCandidates(docName: string, text: string): Candidate[] {
   type Pass = { re: RegExp; handle: (m: RegExpMatchArray) => Omit<Candidate, "doc_name" | "context" | "label_hint" | "source_location"> | null };
 
   const passes: Pass[] = [
-    // Rent — monthly: "$3,050/month", "$3,050 per unit per month", "$3,050 per month".
+    // Rent — monthly: "$3,050/month", "$3,050 per unit per month", "$3,050/unit/month".
     {
-      re: /\$?\s?([\d,]+(?:\.\d+)?)\s*(?:\/\s*mo(?:nth)?\b|per\s+month\b|per\s+unit\s+per\s+month\b|\/\s*unit\s*\/\s*mo\b)/gi,
+      re: /\$?\s?([\d,]+(?:\.\d+)?)\s*(?:\/\s*mo(?:nth)?\b|per\s+month\b|per\s+unit\s+per\s+month\b|\/\s*unit\s*\/\s*(?:mo|month)\b|per\s+unit\s*\/\s*(?:mo|month)\b)/gi,
       handle: (m) => {
         const n = toNumber(m[1]);
         if (!isFinite(n)) return null;
         return { kind: "rent", value_numeric: n, value_text: `$${m[1]}/mo`, unit: "$/mo" };
       },
     },
-    // Rent — per SF: "$42 PSF", "$42/SF", "$42 per square foot".
+    // Rent — per SF with the dollar sign after the number: "55 $/SF".
     {
-      re: /\$?\s?([\d,]+(?:\.\d+)?)\s*(?:psf\b|\/\s*sf\b|per\s+sf\b|per\s+square\s+foot\b|\/\s*square\s+foot\b)/gi,
+      re: /([\d,]+(?:\.\d+)?)\s*\$\s*\/\s*(?:sf|sq\.?\s*ft\.?|square\s+foot|rentable\s+square\s+foot)\b/gi,
+      handle: (m) => {
+        const n = toNumber(m[1]);
+        if (!isFinite(n)) return null;
+        return { kind: "rent", value_numeric: n, value_text: `$${m[1]}/SF`, unit: "$/SF" };
+      },
+    },
+    // Rent — per SF: "$42 PSF", "$42/SF", "$42 per square foot", "55 per rentable square foot".
+    {
+      re: /\$?\s?([\d,]+(?:\.\d+)?)\s*(?:psf\b|\/\s*sf\b|per\s+sf\b|per\s+(?:rentable\s+)?square\s+foot\b|\/\s*(?:rentable\s+)?square\s+foot\b)/gi,
       handle: (m) => {
         const n = toNumber(m[1]);
         if (!isFinite(n)) return null;

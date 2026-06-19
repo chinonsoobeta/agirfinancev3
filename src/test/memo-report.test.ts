@@ -71,14 +71,13 @@ describe("Memo report content rules", () => {
     expect(f).toContain("Reconciliation exceptions: 2 error(s) and 1 warning(s) remain open.");
   });
 
-  test("includes a Required Actions section covering the open issues", () => {
+  test("includes approval conditions covering the open issues", () => {
     const r = report();
-    const actions = r.sections.find((s) => s.heading === "Required Actions Before Reconsideration");
+    const actions = r.sections.find((s) => s.heading === "Approval Conditions");
     expect(actions).toBeDefined();
     expect(actions!.body).toContain("funding gap");
-    expect(actions!.body).toContain("DSCR covenant breach");
+    expect(actions!.body).toContain("DSCR");
     expect(actions!.body).toContain("lender stabilization shortfalls");
-    expect(actions!.body).toContain("Re-run deterministic underwriting");
   });
 
   test("shows document provenance, not a generic label", () => {

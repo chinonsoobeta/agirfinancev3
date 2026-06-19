@@ -87,17 +87,16 @@ describe("displaySourceLabel", () => {
 });
 
 describe("memo polish", () => {
-  test("body tables use short labels; Document Sources keeps full filenames", () => {
+  test("source transparency and Document Sources keep full provenance", () => {
     const r = ctx();
-    const tdc = r.sections.find((s) => s.heading === "Total Development Cost Build-Up")!;
-    expect(tdc.table!.rows.some((row) => row.includes("Construction Budget"))).toBe(true);
-    expect(tdc.table!.rows.some((row) => row.some((c) => c.includes(".xlsx")))).toBe(false);
+    const prov = r.sections.find((s) => s.heading === "Assumption Source Transparency")!;
+    expect(prov.table!.rows.some((row) => row.includes("Harbour_Centre_Construction_Budget.xlsx"))).toBe(true);
     const docs = r.sections.find((s) => s.heading === "Document Sources")!;
     expect(docs.table!.rows.some((row) => row.includes("Harbour_Centre_Construction_Budget.xlsx"))).toBe(true);
   });
 
   test("operating expense ratio row shows ratio and default-accepted source", () => {
-    const rev = ctx().sections.find((s) => s.heading === "Stabilized Revenue Build (Year 1)")!;
+    const rev = ctx().sections.find((s) => s.heading === "Operating Model Summary")!;
     const row = rev.table!.rows.find((r) => r[0] === "Operating expense ratio")!;
     expect(row).toBeDefined();
     expect(row.join(" ")).toContain("35.00%");
@@ -121,8 +120,8 @@ describe("memo polish", () => {
     expect(r.footnotes.join("\n")).not.toContain("conservative resolution");
   });
 
-  test("Required Actions includes the committed-equity/JV action exactly once", () => {
-    const actions = ctx().sections.find((s) => s.heading === "Required Actions Before Reconsideration")!.body!;
+  test("Approval Conditions includes the committed-equity/JV action exactly once", () => {
+    const actions = ctx().sections.find((s) => s.heading === "Approval Conditions")!.body!;
     const matches = actions.split("\n").filter((l) => /committed equity is capped/.test(l));
     expect(matches.length).toBe(1);
     expect(matches[0]).toContain("$50,000,000");

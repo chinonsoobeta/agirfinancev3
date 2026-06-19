@@ -169,6 +169,10 @@ export const extractAssumptions = createServerFn({ method: "POST" })
     const { extractFileText } = await import("./document-text.server");
     const { extractCandidates } = await import("./assumption-candidates.server");
     const { downloadDocumentBlob } = await import("./storage-download.server");
+    const { parseRentRollWorkbook } = await import("./parsers/rent-roll.server");
+    const { mapRevenueProgramRowToAssumptions } = await import("./revenue-assumption-mapper");
+    const { parseBudgetWorkbook } = await import("./parsers/budget.server");
+    const { mapBudgetRowToAssumption } = await import("./budget-assumption-mapper");
     type Cand = Awaited<ReturnType<typeof extractCandidates>>[number];
 
     const warnings: string[] = [];
@@ -182,6 +186,8 @@ export const extractAssumptions = createServerFn({ method: "POST" })
     };
     const perDocument: DocTrace[] = [];
     const allCandidates: Cand[] = [];
+    const structuredRevenueMappings: MappedCandidate[] = [];
+    const structuredBudgetMappings: MappedCandidate[] = [];
     const docByName = new Map(docs.map((d) => [d.name, d]));
     let documentsDownloaded = 0;
 
@@ -217,6 +223,16 @@ export const extractAssumptions = createServerFn({ method: "POST" })
         row.candidate_count = cands.length;
         row.candidates_preview = cands.slice(0, 5).map((c) => ({ kind: c.kind, value_text: c.value_text, label_hint: c.label_hint.slice(0, 48) }));
         allCandidates.push(...cands);
+        if (/\.(xlsx|xls)$/i.test(d.name)) {
+          const parsedRevenue = parseRentRollWorkbook(buf);
+          structuredRevenueMappings.push(
+            ...parsedRevenue.inserted.flatMap((revRow) => mapRevenueProgramRowToAssumptions(revRow, { name: d.name })),
+          );
+          const parsedBudget = parseBudgetWorkbook(buf);
+          structuredBudgetMappings.push(
+            ...(parsedBudget.inserted.map((budgetRow) => mapBudgetRowToAssumption(budgetRow, { name: d.name })).filter(Boolean) as MappedCandidate[]),
+          );
+        }
       } catch (error) {
         row.error = error instanceof Error ? error.message : "unreadable document";
         skippedDocs.push(`${d.name}: ${row.error}`);
@@ -292,7 +308,7 @@ export const extractAssumptions = createServerFn({ method: "POST" })
       }
     }
 
-    const mapped = [...deterministic, ...aiMapped];
+    const mapped = [...deterministic, ...structuredBudgetMappings, ...structuredRevenueMappings, ...aiMapped];
 
     // ===== Stage 3 — group & resolve (conflicts preserved) =====
     const grouped = groupAndResolve(mapped);

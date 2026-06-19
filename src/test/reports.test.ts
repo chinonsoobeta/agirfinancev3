@@ -123,12 +123,12 @@ describe("report builders", () => {
   const data = harbourReportData();
   const opts = { generatedLabel: "June 2026" };
 
-  test("investor report: key metrics, scenario analysis, risks, IRR N/M, footer", () => {
+  test("investor report: key metrics, sensitivity analysis, risks, IRR N/M, footer", () => {
     const r = buildReport("investor_report", data, opts);
     expect(r.title).toBe("Investor Report");
     const t = allText(r);
     expect(r.sections.some((s) => s.heading === "Key Returns")).toBe(true);
-    expect(r.sections.some((s) => s.heading.startsWith("Scenario Analysis"))).toBe(true);
+    expect(r.sections.some((s) => s.heading === "Sensitivity Analysis")).toBe(true);
     expect(r.sections.some((s) => s.heading === "Risk Register")).toBe(true);
     expect(t).toContain("Not meaningful"); // IRR on equity wipeout
     expect(r.footnotes.join(" ")).toContain("No AI-generated financial values were used.");
