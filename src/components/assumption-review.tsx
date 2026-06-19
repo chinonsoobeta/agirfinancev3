@@ -155,6 +155,7 @@ export function AssumptionReviewCenter({ projectId }: { projectId: string }) {
       </Card>
 
       {report && <ExtractionReportCard report={report} onClose={() => setReport(null)} />}
+      {report?.debug && <ExtractionDebugCard debug={report.debug} />}
 
       {assumptions.length === 0 ? (
         <Card className="p-12 text-center text-sm text-muted-foreground">
@@ -340,6 +341,64 @@ function ExtractionReportCard({ report, onClose }: { report: any; onClose: () =>
         <div className="mt-2 text-xs">
           <span className="font-semibold text-chart-5 uppercase tracking-widest">Missing required:</span>{" "}
           <span className="text-muted-foreground">{report.missing_required.join(" · ")}</span>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function ExtractionDebugCard({ debug }: { debug: any }) {
+  return (
+    <Card className="p-5 border-chart-2/40">
+      <div className="text-[10px] uppercase tracking-widest text-muted-foreground">Extraction Debug Trace</div>
+      <div className="grid grid-cols-2 md:grid-cols-6 gap-3 mt-3 text-sm">
+        <Field label="Docs seen">{debug.documents_seen}</Field>
+        <Field label="Downloaded">{debug.documents_downloaded}</Field>
+        <Field label="Failed">{debug.documents_failed}</Field>
+        <Field label="Candidates">{debug.total_candidates}</Field>
+        <Field label="Alias mapped">{debug.alias_mapped_count}</Field>
+        <Field label="AI classified">{debug.classified_count}</Field>
+      </div>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3 text-sm">
+        <Field label="Grouped keys">{debug.grouped_keys?.length ?? 0}</Field>
+        <Field label="Conflicts">{debug.conflict_keys?.join(", ") || "—"}</Field>
+        <Field label="Inserted">{debug.inserted_assumptions}</Field>
+        <Field label="Updated">{debug.updated_assumptions}</Field>
+      </div>
+
+      <div className="mt-4 overflow-x-auto">
+        <table className="data-grid w-full text-xs">
+          <thead><tr className="bg-muted/20">
+            <th className="text-left">Document</th>
+            <th className="text-center">DL</th>
+            <th className="text-right">Bytes</th>
+            <th className="text-right">Text len</th>
+            <th className="text-right">Candidates</th>
+            <th className="text-left">Preview / error</th>
+          </tr></thead>
+          <tbody>
+            {debug.per_document?.map((d: any) => (
+              <tr key={d.document_id} className="hover:bg-accent/30 align-top">
+                <td className="font-medium">{d.name}</td>
+                <td className="text-center">{d.download_ok ? "✓" : "✗"}</td>
+                <td className="text-right num">{d.byte_length.toLocaleString()}</td>
+                <td className="text-right num">{d.text_length.toLocaleString()}</td>
+                <td className="text-right num">{d.candidate_count}</td>
+                <td className="text-muted-foreground max-w-[280px] truncate">
+                  {d.error
+                    ? <span className="text-destructive">{d.error}</span>
+                    : d.candidates_preview?.map((c: any) => `${c.value_text}`).join(" · ") || d.text_preview}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {debug.warnings?.length > 0 && (
+        <div className="mt-3 text-xs text-chart-5">
+          <span className="font-semibold uppercase tracking-widest">Warnings:</span>{" "}
+          <span className="text-muted-foreground">{debug.warnings.join(" · ")}</span>
         </div>
       )}
     </Card>

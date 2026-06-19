@@ -1,5 +1,11 @@
 // Server-only helpers for parsing uploaded documents into plain text.
-// Used by analyzeDocument and the assumption extraction engine.
+// Used by analyzeDocument and the assumption extraction engine. Every branch
+// logs the resulting text length so the extraction debug trace and server logs
+// can pinpoint a parsing failure (storage vs. parse vs. empty document).
+
+function log(name: string, kind: string, length: number, note = "") {
+  console.log(`[document-text] ${kind} "${name}" -> ${length} chars${note ? ` (${note})` : ""}`);
+}
 
 export async function pdfBufferToText(buf: ArrayBuffer): Promise<string> {
   const { extractText, getDocumentProxy } = await import("unpdf");
@@ -8,6 +14,9 @@ export async function pdfBufferToText(buf: ArrayBuffer): Promise<string> {
   return Array.isArray(text) ? text.join("\n") : String(text ?? "");
 }
 
+// Spreadsheets are emitted with sheet names and per-row labels preserved so the
+// candidate extractor keeps each value's financial context, e.g.:
+//   Sheet Construction Budget row 4: Land acquisition | $34,500,000
 export async function xlsxBufferToText(buf: ArrayBuffer): Promise<string> {
   const XLSX = await import("xlsx");
   const wb = XLSX.read(new Uint8Array(buf), { type: "array" });
@@ -18,7 +27,8 @@ export async function xlsxBufferToText(buf: ArrayBuffer): Promise<string> {
     const rows = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, blankrows: false });
     const headers = (rows[0] ?? []).map((cell) => String(cell ?? "").trim().toLowerCase());
     rows.forEach((row, index) => {
-      out.push(`${index + 1}: ${row.map((cell, columnIndex) => formatSpreadsheetCell(cell, headers[columnIndex], row)).join(" | ")}`);
+      const cells = row.map((cell, columnIndex) => formatSpreadsheetCell(cell, headers[columnIndex], row)).join(" | ");
+      out.push(`Sheet ${name} row ${index + 1}: ${cells}`);
     });
   }
   return out.join("\n");
@@ -32,23 +42,110 @@ function formatSpreadsheetCell(cell: unknown, header: string | undefined, row: u
     .slice(0, 2)
     .map((value) => String(value ?? "").toLowerCase())
     .join(" ");
-  const financialContext = [
-    header ?? "",
-    rowLabel,
-  ].join(" ");
+  const financialContext = [header ?? "", rowLabel].join(" ");
 
   const looksLikeMoney =
-    /\b(amount|budget|cost|price|value|loan|equity|debt|proceeds|income|revenue|rent|noi|opex|expense|tdc|total|contingency|financing)\b/.test(financialContext) &&
-    Math.abs(cell) >= 1000;
+    /\b(amount|budget|cost|price|value|loan|equity|debt|proceeds|income|revenue|rent|noi|opex|expense|tdc|total|contingency|financing|acquisition|land|soft|hard|capital|reserve|fee)\b/.test(
+      financialContext,
+    ) && Math.abs(cell) >= 1000;
 
-  const formatted = Math.round(cell) === cell ? String(cell) : String(cell);
+  const formatted = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(cell);
   return looksLikeMoney ? `$${formatted}` : formatted;
+}
+
+// Best-effort DOCX text extraction using only Node built-ins. A .docx is a ZIP
+// archive; we locate word/document.xml via the central directory, inflate it,
+// and strip the WordprocessingML tags. Returns "" on any failure rather than
+// throwing, so a single bad document never breaks extraction.
+export async function docxBufferToText(buf: ArrayBuffer): Promise<string> {
+  try {
+    const zlib = await import("node:zlib");
+    const bytes = Buffer.from(buf);
+    // Find End Of Central Directory record (signature 0x06054b50), scanning back.
+    let eocd = -1;
+    for (let i = bytes.length - 22; i >= 0 && i >= bytes.length - 22 - 65536; i--) {
+      if (bytes.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+    }
+    if (eocd < 0) return "";
+    const cdOffset = bytes.readUInt32LE(eocd + 16);
+    const cdCount = bytes.readUInt16LE(eocd + 10);
+
+    let ptr = cdOffset;
+    for (let n = 0; n < cdCount; n++) {
+      if (bytes.readUInt32LE(ptr) !== 0x02014b50) break;
+      const method = bytes.readUInt16LE(ptr + 10);
+      const compSize = bytes.readUInt32LE(ptr + 20);
+      const nameLen = bytes.readUInt16LE(ptr + 28);
+      const extraLen = bytes.readUInt16LE(ptr + 30);
+      const commentLen = bytes.readUInt16LE(ptr + 32);
+      const localOffset = bytes.readUInt32LE(ptr + 42);
+      const name = bytes.toString("utf8", ptr + 46, ptr + 46 + nameLen);
+
+      if (name === "word/document.xml") {
+        // Parse the local header to find where the data starts.
+        if (bytes.readUInt32LE(localOffset) !== 0x04034b50) return "";
+        const lNameLen = bytes.readUInt16LE(localOffset + 26);
+        const lExtraLen = bytes.readUInt16LE(localOffset + 28);
+        const dataStart = localOffset + 30 + lNameLen + lExtraLen;
+        const comp = bytes.subarray(dataStart, dataStart + compSize);
+        const xml = method === 0 ? comp : zlib.inflateRawSync(comp);
+        // Insert separators at run/cell/row/paragraph boundaries BEFORE stripping
+        // tags. Without this, adjacent text runs concatenate with no whitespace
+        // (e.g. "$162,500,000Preferred Equity"), which both glues labels to the
+        // next value and truncates numbers at internal commas during extraction.
+        const text = String(xml)
+          .replace(/<\/w:t>/g, " ")
+          .replace(/<w:tab\b[^>]*\/?>/g, "\t")
+          .replace(/<w:br\b[^>]*\/?>/g, "\n")
+          .replace(/<\/w:tc>/g, "\t")
+          .replace(/<\/w:tr>/g, "\n")
+          .replace(/<\/w:p>/g, "\n")
+          .replace(/<[^>]+>/g, "")
+          .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+          .replace(/[ \t]{2,}/g, " ")
+          .replace(/[ \t]+\n/g, "\n")
+          .trim();
+        return text;
+      }
+      ptr += 46 + nameLen + extraLen + commentLen;
+    }
+    return "";
+  } catch (error) {
+    console.warn(`[document-text] docx parse failed: ${error instanceof Error ? error.message : String(error)}`);
+    return "";
+  }
 }
 
 export async function extractFileText(name: string, fileType: string | null | undefined, buf: ArrayBuffer): Promise<string> {
   const lower = name.toLowerCase();
-  if (lower.endsWith(".pdf") || fileType?.includes("pdf")) return pdfBufferToText(buf);
-  if (lower.endsWith(".xlsx") || lower.endsWith(".xls") || fileType?.includes("sheet")) return xlsxBufferToText(buf);
-  // Plain text fallback
-  return new TextDecoder().decode(buf);
+  const type = (fileType ?? "").toLowerCase();
+  try {
+    if (lower.endsWith(".pdf") || type.includes("pdf")) {
+      const text = await pdfBufferToText(buf);
+      log(name, "pdf", text.length);
+      return text;
+    }
+    if (lower.endsWith(".xlsx") || lower.endsWith(".xls") || type.includes("sheet") || type.includes("excel")) {
+      const text = await xlsxBufferToText(buf);
+      log(name, "xlsx", text.length);
+      return text;
+    }
+    if (lower.endsWith(".docx") || type.includes("wordprocessingml")) {
+      const text = await docxBufferToText(buf);
+      log(name, "docx", text.length, text ? "" : "no text recovered");
+      return text;
+    }
+    if (lower.endsWith(".csv") || lower.endsWith(".tsv") || type.includes("csv")) {
+      const text = new TextDecoder().decode(buf);
+      log(name, "csv", text.length);
+      return text;
+    }
+    // .txt and any other text-like payload.
+    const text = new TextDecoder().decode(buf);
+    log(name, "text", text.length);
+    return text;
+  } catch (error) {
+    console.warn(`[document-text] extractFileText failed for "${name}" (${type}): ${error instanceof Error ? error.message : String(error)}`);
+    return "";
+  }
 }

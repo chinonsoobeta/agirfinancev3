@@ -478,6 +478,45 @@ export type Database = {
           },
         ]
       }
+      generated_reports: {
+        Row: {
+          content_json: Json
+          created_at: string
+          generated_at: string
+          id: string
+          owner_id: string
+          project_id: string
+          report_type: string
+          status: string
+          title: string | null
+          verification_report: Json | null
+        }
+        Insert: {
+          content_json: Json
+          created_at?: string
+          generated_at?: string
+          id?: string
+          owner_id: string
+          project_id: string
+          report_type: string
+          status?: string
+          title?: string | null
+          verification_report?: Json | null
+        }
+        Update: {
+          content_json?: Json
+          created_at?: string
+          generated_at?: string
+          id?: string
+          owner_id?: string
+          project_id?: string
+          report_type?: string
+          status?: string
+          title?: string | null
+          verification_report?: Json | null
+        }
+        Relationships: []
+      }
       investment_memos: {
         Row: {
           content: Json
@@ -485,6 +524,8 @@ export type Database = {
           id: string
           owner_id: string
           project_id: string
+          status: string | null
+          verification_report: Json | null
         }
         Insert: {
           content: Json
@@ -492,6 +533,8 @@ export type Database = {
           id?: string
           owner_id: string
           project_id: string
+          status?: string | null
+          verification_report?: Json | null
         }
         Update: {
           content?: Json
@@ -499,6 +542,8 @@ export type Database = {
           id?: string
           owner_id?: string
           project_id?: string
+          status?: string | null
+          verification_report?: Json | null
         }
         Relationships: [
           {

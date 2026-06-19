@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "agir-dev",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [".claude/dev-node22.sh"],
+      "port": 8080
+    }
+  ]
+}

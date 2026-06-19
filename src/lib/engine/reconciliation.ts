@@ -23,6 +23,7 @@ export type ReconciliationContext = {
   lenderStabilizedOccupancyPct?: number | null;
   componentOccupancies?: { unitType: string; occupancyPct: number | null }[];
   statedTotalProjectCost?: number | null;
+  statedTotalSource?: string | null; // where the stated total was extracted from
   budgetSum?: number | null;
   unitCounts?: number[]; // unit counts seen across documents; must agree
 };
@@ -94,12 +95,23 @@ export function runReconciliationChecks(ctx: ReconciliationContext): Reconciliat
 
   // 5. Budget-line sums vs any stated total.
   if (ctx.statedTotalProjectCost != null && ctx.budgetSum != null && ctx.statedTotalProjectCost > 0) {
-    const delta = Math.abs(ctx.budgetSum - ctx.statedTotalProjectCost);
-    if (delta / ctx.statedTotalProjectCost > 0.005) {
+    const source = ctx.statedTotalSource ? ` Stated total sourced from: ${ctx.statedTotalSource}.` : "";
+    if (ctx.statedTotalProjectCost < 0.5 * ctx.budgetSum) {
+      // Suspect extraction: a stated total below half the budget sum is almost
+      // always a mis-mapped line (e.g. a loan amount read as the total). Surface
+      // it for review as a WARNING — never a hard reconciliation error.
+      flags.push({
+        check_key: "budget_vs_stated_total",
+        severity: "warning",
+        message: `Suspect stated total project cost ${fmt(ctx.statedTotalProjectCost)} is below half the budget sum ${fmt(ctx.budgetSum)} — likely a mis-extracted value. Pending review; not treated as a hard reconciliation error.${source}`,
+        expected: ctx.statedTotalProjectCost,
+        actual: ctx.budgetSum,
+      });
+    } else if (Math.abs(ctx.budgetSum - ctx.statedTotalProjectCost) / ctx.statedTotalProjectCost > 0.005) {
       flags.push({
         check_key: "budget_vs_stated_total",
         severity: "error",
-        message: `Budget lines sum to ${fmt(ctx.budgetSum)} but documents state total project cost ${fmt(ctx.statedTotalProjectCost)}.`,
+        message: `Budget lines sum to ${fmt(ctx.budgetSum)} but documents state total project cost ${fmt(ctx.statedTotalProjectCost)}.${source}`,
         expected: ctx.statedTotalProjectCost,
         actual: ctx.budgetSum,
       });

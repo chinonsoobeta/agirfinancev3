@@ -28,7 +28,7 @@ export type AssumptionDef = {
 
 export const ASSUMPTION_DEFS: AssumptionDef[] = [
   { key: "land_cost", label: "Land Cost", category: "Costs", unit: "$", numeric: true, required: true,
-    aliases: ["land cost","acquisition cost","acquisition price","purchase price","site acquisition","site cost","land basis","land purchase"] },
+    aliases: ["land cost","land acquisition","acquisition cost","acquisition price","purchase price","site acquisition","site cost","land basis","land purchase"] },
   { key: "hard_costs", label: "Hard / Construction Costs", category: "Costs", unit: "$", numeric: true, required: true,
     aliases: ["hard cost","hard costs","construction cost","construction costs","building costs","gmp","guaranteed maximum price","trade costs","direct costs"] },
   { key: "soft_costs", label: "Soft Costs", category: "Costs", unit: "$", numeric: true, required: false,
@@ -42,7 +42,7 @@ export const ASSUMPTION_DEFS: AssumptionDef[] = [
   { key: "tax_reassessment", label: "Tax Reassessment", category: "Costs", unit: "$", numeric: true, required: false,
     aliases: ["tax reassessment","property tax reassessment","reassessed taxes","mill rate change"] },
   { key: "total_project_cost", label: "Total Project Cost", category: "Costs", unit: "$", numeric: true, required: false,
-    aliases: ["total project cost","tpc","total development cost","tdc","total cost"] },
+    aliases: ["total project cost","tpc","total development cost","tdc","total budget","total cost"] },
 
   { key: "residential_units", label: "Residential Units", category: "Revenue", unit: "units", numeric: true, required: false,
     aliases: ["residential units","apartment units","unit count","multifamily units","rental units"] },
@@ -78,9 +78,9 @@ export const ASSUMPTION_DEFS: AssumptionDef[] = [
     aliases: ["lease-up","lease up","lease-up period","lease-up schedule","absorption period"] },
 
   { key: "debt_amount", label: "Debt Amount", category: "Capital Stack", unit: "$", numeric: true, required: true,
-    aliases: ["debt amount","loan amount","senior loan","construction loan","mortgage amount","facility size"] },
+    aliases: ["debt amount","loan amount","senior loan","senior construction debt","construction debt","senior debt","construction loan","mortgage amount","facility size"] },
   { key: "equity_amount", label: "Equity Amount", category: "Capital Stack", unit: "$", numeric: true, required: true,
-    aliases: ["equity amount","sponsor equity","total equity","equity contribution","equity check"] },
+    aliases: ["equity amount","sponsor equity","common equity","total equity","equity contribution","equity check"] },
   { key: "interest_rate", label: "Interest Rate", category: "Capital Stack", unit: "%", numeric: true, required: true,
     aliases: ["interest rate","coupon","loan rate","sofr spread","all-in rate","note rate"] },
   { key: "ltc", label: "Loan-to-Cost", category: "Capital Stack", unit: "%", numeric: true, required: false,

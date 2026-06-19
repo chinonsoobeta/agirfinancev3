@@ -4,7 +4,8 @@
 import { createServerFn } from "@tanstack/react-start";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { z } from "zod";
-import { ASSUMPTION_DEFS, ASSUMPTION_BY_KEY, ASSUMPTION_KEYS, REQUIRED_KEYS, resolveAlias, bandFor } from "./assumption-taxonomy";
+import { ASSUMPTION_DEFS, ASSUMPTION_BY_KEY, ASSUMPTION_KEYS, REQUIRED_KEYS, bandFor } from "./assumption-taxonomy";
+import { mapCandidates, groupAndResolve, rankCandidates, mapCandidateToKey, type MappedCandidate } from "./assumption-mapping";
 
 // ---------- Read APIs ----------
 
@@ -131,22 +132,23 @@ function requiredKeysSatisfiedBy(map: Map<string, any>) {
   });
 }
 
-// ---------- Extraction (3-stage pipeline) ----------
+// ---------- Extraction (deterministic pipeline + debug trace) ----------
 //
-// Stage 1 — Document Parsing: regex sweep of every uploaded document
-//   pulls currency values, percentages, dates, unit counts, square
-//   footage, and ratios. Output is a typed candidate list with the
-//   surrounding context and the phrase to the LEFT of the match
-//   (the natural label).
+// Stage 1 — Document parsing: regex sweep of every uploaded document yields a
+//   typed candidate list (value + unit + context + label hint + source loc).
+// Stage 2 — Deterministic alias mapping (assumption-mapping.ts) is the
+//   AUTHORITATIVE classifier: it maps each candidate to a canonical field_key
+//   from its label/context + unit-kind compatibility. No LLM, no invented
+//   values.
+// Stage 2b — OPTIONAL AI classification runs only when an API key is configured
+//   and only for candidates the deterministic stage left unresolved, for keys
+//   not already resolved. It can never override a deterministic mapping nor mint
+//   a value the regex pass did not lift from a document.
+// Stage 3 — Grouping & conflict detection: multiple distinct values for one key
+//   become a conflict (value null, sources preserved, blocks underwriting).
 //
-// Stage 2 — Assumption Classification: the AI receives the candidate
-//   list (NOT the raw document) and must label each candidate with one
-//   of our canonical field_keys or "ignore". This constrains the AI to
-//   real values lifted from the documents and removes hallucinations.
-//
-// Stage 3 — Assumption Mapping: candidates classified by the AI are
-//   merged with alias-based fallbacks (resolveAlias on label_hint).
-//   Multiple distinct values for the same key become a conflict.
+// Returns the audit report plus a structured `debug` trace that pinpoints where
+// a run produced — or failed to produce — values.
 
 const ClassificationSchema = z.object({
   candidate_index: z.number().int(),
@@ -164,127 +166,136 @@ export const extractAssumptions = createServerFn({ method: "POST" })
     if (dErr) throw new Error(dErr.message);
     if (!docs?.length) throw new Error("Upload documents to this project before extracting assumptions.");
 
-    // ===== Stage 1 — Document Parsing =====
     const { extractFileText } = await import("./document-text.server");
     const { extractCandidates } = await import("./assumption-candidates.server");
+    const { downloadDocumentBlob } = await import("./storage-download.server");
     type Cand = Awaited<ReturnType<typeof extractCandidates>>[number];
+
+    const warnings: string[] = [];
+    const skippedDocs: string[] = [];
+    type DocTrace = {
+      document_id: string; name: string; storage_path: string;
+      download_ok: boolean; byte_length: number; file_type: string | null;
+      text_length: number; text_preview: string; candidate_count: number;
+      candidates_preview: Array<{ kind: string; value_text: string; label_hint: string }>;
+      error: string | null;
+    };
+    const perDocument: DocTrace[] = [];
     const allCandidates: Cand[] = [];
     const docByName = new Map(docs.map((d) => [d.name, d]));
-    const skippedDocs: string[] = [];
+    let documentsDownloaded = 0;
+
+    // ===== Stage 1 — parse every document, recording a debug row per doc =====
     for (const d of docs) {
+      const row: DocTrace = {
+        document_id: d.id, name: d.name, storage_path: d.storage_path,
+        download_ok: false, byte_length: 0, file_type: d.file_type ?? null,
+        text_length: 0, text_preview: "", candidate_count: 0, candidates_preview: [], error: null,
+      };
       try {
-        const { downloadDocumentBlob } = await import("./storage-download.server");
         const dl = await downloadDocumentBlob(context.supabase, d.storage_path);
         if (dl.error || !dl.data) {
-          skippedDocs.push(`${d.name}: ${dl.error?.message ?? "download failed"}`);
+          row.error = dl.error?.message ?? "download failed";
+          skippedDocs.push(`${d.name}: ${row.error}`);
+          perDocument.push(row);
           continue;
         }
+        row.download_ok = true;
+        documentsDownloaded++;
         const buf = await dl.data.arrayBuffer();
+        row.byte_length = buf.byteLength;
         const text = await extractFileText(d.name, d.file_type, buf);
+        row.text_length = text.length;
+        row.text_preview = text.slice(0, 200);
+        if (!text.trim()) {
+          row.error = "no extractable text";
+          warnings.push(`${d.name}: downloaded ${buf.byteLength} bytes but no text could be parsed.`);
+          perDocument.push(row);
+          continue;
+        }
         const cands = extractCandidates(d.name, text.slice(0, 40000));
+        row.candidate_count = cands.length;
+        row.candidates_preview = cands.slice(0, 5).map((c) => ({ kind: c.kind, value_text: c.value_text, label_hint: c.label_hint.slice(0, 48) }));
         allCandidates.push(...cands);
       } catch (error) {
-        skippedDocs.push(`${d.name}: ${error instanceof Error ? error.message : "unreadable document"}`);
+        row.error = error instanceof Error ? error.message : "unreadable document";
+        skippedDocs.push(`${d.name}: ${row.error}`);
       }
+      perDocument.push(row);
     }
     if (!allCandidates.length) {
-      if (skippedDocs.length) {
-        throw new Error(`No extractable values found because uploaded documents could not be read: ${skippedDocs.join("; ")}`);
-      }
-      throw new Error("No extractable values found in uploaded documents.");
+      warnings.push(
+        skippedDocs.length
+          ? `No candidates: documents could not be read (${skippedDocs.join("; ")}).`
+          : "No extractable values found in uploaded documents.",
+      );
     }
 
-    // ===== Stage 2 — AI Classification =====
-    const taxonomyText = ASSUMPTION_DEFS.map(
-      (d) => `- ${d.key} (${d.label}, unit ${d.unit}${d.required ? ", REQUIRED" : ""}) aliases: ${d.aliases.slice(0, 6).join(" / ")}`
-    ).join("\n");
-    const cap = Math.min(allCandidates.length, 220);
-    const candidateList = allCandidates.slice(0, cap).map((c, i) =>
-      `${i}. [${c.kind}] value=${c.value_text} ctx="${c.context.slice(0, 220)}" hint="${c.label_hint.slice(0, 80)}" doc="${c.doc_name}"`
-    ).join("\n");
-
-    const { getAgirModel } = await import("./ai-gateway.server");
-    const { generateText } = await import("ai");
-    let classifications: z.infer<typeof ClassificationSchema>[] = [];
-    try {
-      const { text } = await generateText({
-        model: getAgirModel(),
-        // temperature 0: identical documents must yield identical assumption sets.
-        temperature: 0,
-        system: `You are an institutional real estate underwriter. Classify pre-extracted numeric candidates from project documents into canonical assumption keys. Use ONLY the candidate context to decide; never invent values. If a candidate clearly does not match any canonical assumption, use field_key="ignore".`,
-        prompt: `Canonical assumption taxonomy:\n${taxonomyText}\n\nCandidates (index. [kind] value ctx hint doc):\n${candidateList}\n\nReturn a single JSON array (no prose, no markdown fences). One entry per candidate you classify. Schema: {"candidate_index":<int>,"field_key":"<taxonomy key or ignore>","confidence_score":<0-100>,"reasoning":"<short>"}. Skip candidates you cannot confidently classify.`,
-      });
-      const m = text.match(/\[[\s\S]*\]/);
-      const parsed = m ? JSON.parse(m[0]) : [];
-      const safe = z.array(ClassificationSchema).safeParse(parsed);
-      if (safe.success) classifications = safe.data.filter((c) => c.field_key === "ignore" || ASSUMPTION_KEYS.includes(c.field_key));
-    } catch {
-      classifications = [];
-    }
-
-    // ===== Stage 3 — Assumption Mapping (AI + alias fallback) =====
-    type Mapped = {
-      field_key: string; value_numeric: number | null; value_text: string | null;
-      confidence_score: number; source_doc_name: string; source_text: string;
-      reasoning: string; via: "ai" | "alias";
-    };
-    const mapped: Mapped[] = [];
-
-    for (const cls of classifications) {
-      if (cls.field_key === "ignore") continue;
-      const cand = allCandidates[cls.candidate_index];
-      if (!cand) continue;
-      const def = ASSUMPTION_BY_KEY[cls.field_key];
-      if (!def) continue;
-      mapped.push({
-        field_key: def.key,
-        value_numeric: def.numeric ? cand.value_numeric : null,
-        value_text: def.numeric ? null : cand.value_text,
-        confidence_score: Math.round(cls.confidence_score),
-        source_doc_name: cand.doc_name,
-        source_text: cand.context,
-        reasoning: cls.reasoning || "AI-classified candidate",
-        via: "ai",
-      });
-    }
-
-    // Alias fallback — for any candidate the AI ignored, check if the
-    // label hint matches a canonical alias. Adds inferred values.
-    const aiCandidateIndices = new Set(classifications.filter((c) => c.field_key !== "ignore").map((c) => c.candidate_index));
-    let inferredCount = 0;
+    // ===== Stage 2 — deterministic alias mapping (authoritative) =====
+    const deterministic = mapCandidates(allCandidates);
+    const deterministicKeys = new Set(deterministic.map((m) => m.field_key));
+    const mappedIndices = new Set<number>();
     for (let i = 0; i < allCandidates.length; i++) {
-      if (aiCandidateIndices.has(i)) continue;
-      const cand = allCandidates[i];
-      const fk = resolveAlias(cand.label_hint);
-      if (!fk) continue;
-      const def = ASSUMPTION_BY_KEY[fk];
-      if (!def || !def.numeric || cand.value_numeric == null) continue;
-      // Unit sanity check
-      if (def.unit === "%" && cand.kind !== "percent") continue;
-      if (def.unit === "$" && cand.kind !== "currency") continue;
-      if (def.unit === "SF" && cand.kind !== "sf") continue;
-      if ((def.unit === "yr" || def.unit === "mo") && cand.kind !== "duration") continue;
-      if (def.unit === "$/SF" && cand.kind !== "rent") continue;
-      mapped.push({
-        field_key: def.key,
-        value_numeric: cand.value_numeric,
-        value_text: null,
-        confidence_score: 55,
-        source_doc_name: cand.doc_name,
-        source_text: cand.context,
-        reasoning: `Alias-matched "${cand.label_hint.slice(-40)}" → ${def.label}`,
-        via: "alias",
-      });
-      inferredCount++;
+      if (mapCandidateToKey(allCandidates[i])) mappedIndices.add(i);
     }
 
-    // Group by field_key and detect conflicts (multiple distinct numeric values)
-    const grouped = new Map<string, Mapped[]>();
-    for (const m of mapped) {
-      const arr = grouped.get(m.field_key) ?? [];
-      arr.push(m);
-      grouped.set(m.field_key, arr);
+    // ===== Stage 2b — OPTIONAL AI classification of unresolved candidates =====
+    let classifiedCount = 0;
+    const aiMapped: MappedCandidate[] = [];
+    const unresolved = allCandidates.map((c, i) => ({ c, i })).filter(({ i }) => !mappedIndices.has(i));
+    if (unresolved.length && process.env.ANTHROPIC_API_KEY) {
+      try {
+        const rankedSet = new Set(rankCandidates(unresolved.map((u) => u.c), { cap: 160 }));
+        const subset = unresolved.filter((u) => rankedSet.has(u.c));
+        const taxonomyText = ASSUMPTION_DEFS.map(
+          (d) => `- ${d.key} (${d.label}, unit ${d.unit}${d.required ? ", REQUIRED" : ""}) aliases: ${d.aliases.slice(0, 6).join(" / ")}`,
+        ).join("\n");
+        const candidateList = subset.map((u, i) =>
+          `${i}. [${u.c.kind}] value=${u.c.value_text} ctx="${u.c.context.slice(0, 200)}" hint="${u.c.label_hint.slice(0, 80)}" doc="${u.c.doc_name}"`,
+        ).join("\n");
+        const { getAgirModel } = await import("./ai-gateway.server");
+        const { generateText } = await import("ai");
+        const { text } = await generateText({
+          model: getAgirModel(),
+          temperature: 0,
+          system: `You are an institutional real estate underwriter. Classify pre-extracted numeric candidates into canonical assumption keys. Use ONLY the candidate context; never invent values. If a candidate does not match, use field_key="ignore".`,
+          prompt: `Canonical taxonomy:\n${taxonomyText}\n\nCandidates:\n${candidateList}\n\nReturn a JSON array (no prose). Schema: {"candidate_index":<int>,"field_key":"<key or ignore>","confidence_score":<0-100>,"reasoning":"<short>"}.`,
+        });
+        const m = text.match(/\[[\s\S]*\]/);
+        const parsed = m ? JSON.parse(m[0]) : [];
+        const safe = z.array(ClassificationSchema).safeParse(parsed);
+        if (safe.success) {
+          for (const cls of safe.data) {
+            if (cls.field_key === "ignore" || !ASSUMPTION_KEYS.includes(cls.field_key)) continue;
+            if (deterministicKeys.has(cls.field_key)) continue; // never override deterministic
+            const u = subset[cls.candidate_index];
+            if (!u) continue;
+            const def = ASSUMPTION_BY_KEY[cls.field_key];
+            if (!def || (def.numeric && u.c.value_numeric == null)) continue;
+            aiMapped.push({
+              field_key: def.key,
+              value_numeric: def.numeric ? u.c.value_numeric : null,
+              value_text: def.numeric ? null : u.c.value_text,
+              unit: def.unit,
+              confidence: Math.round(cls.confidence_score),
+              source_doc_name: u.c.doc_name,
+              source_text: u.c.context,
+              source_location: u.c.source_location,
+              matched_alias: "(ai)",
+              via: "alias",
+            });
+            classifiedCount++;
+          }
+        }
+      } catch (error) {
+        warnings.push(`AI classification skipped: ${error instanceof Error ? error.message : "unavailable"}`);
+      }
     }
+
+    const mapped = [...deterministic, ...aiMapped];
+
+    // ===== Stage 3 — group & resolve (conflicts preserved) =====
+    const grouped = groupAndResolve(mapped);
 
     const conflictKeys: string[] = [];
     const foundKeys: string[] = [];
@@ -296,21 +307,21 @@ export const extractAssumptions = createServerFn({ method: "POST" })
     const existingByKey = new Map((existing ?? []).map((a) => [a.field_key, a]));
     const ANALYST_LOCKED = new Set(["approved", "modified", "default_accepted"]);
 
-    for (const [fk, arr] of grouped.entries()) {
+    let insertedAssumptions = 0;
+    let updatedAssumptions = 0;
+
+    for (const [fk, res] of grouped.entries()) {
       const def = ASSUMPTION_BY_KEY[fk];
-      arr.sort((a, b) => b.confidence_score - a.confidence_score);
-      const winner = arr[0];
-      const distinct = Array.from(new Set(arr.map((a) =>
-        a.value_numeric != null ? Math.round(a.value_numeric * 1000) / 1000 : a.value_text
-      )));
-      const isConflict = distinct.length > 1;
+      if (!def) continue;
+      const winner = res.winner;
+      const isConflict = res.status === "conflicting";
 
       const prev = existingByKey.get(fk);
       // Re-running extraction never silently overwrites approved/analyst rows.
       // New candidates for an approved key surface as proposed changes.
       if (prev && ANALYST_LOCKED.has(prev.status)) {
         const prevValue = prev.value_numeric != null ? Math.round(Number(prev.value_numeric) * 1000) / 1000 : prev.value_text;
-        const newCandidates = distinct.filter((v) => v !== prevValue);
+        const newCandidates = res.distinct.filter((v) => v !== prevValue);
         if (newCandidates.length) {
           proposedKeys.push(fk);
           auditEntries.push({ field_key: fk, status: "proposed_change", chosen: prevValue, alternates: newCandidates, source_doc: winner.source_doc_name });
@@ -325,30 +336,21 @@ export const extractAssumptions = createServerFn({ method: "POST" })
       else foundKeys.push(fk);
 
       const srcDoc = docByName.get(winner.source_doc_name);
-      const status: "extracted" | "conflicting" = isConflict ? "conflicting" : "extracted";
-      // Conflicts carry NO single value: both candidates are stored
-      // side-by-side with sources, and the key blocks readiness until resolved.
-      const conflictValues = isConflict
-        ? arr
-            .filter((a) => a.value_numeric != null)
-            .map((a) => ({ value: a.value_numeric, source: a.source_doc_name }))
-            .filter((c, i, all) => all.findIndex((x) => x.value === c.value) === i)
-        : null;
       const payload = {
         project_id: data.project_id, owner_id: context.userId,
         field_key: def.key, field_label: def.label, category: def.category, unit: def.unit,
-        value_numeric: isConflict ? null : winner.value_numeric,
-        value_text: isConflict ? null : winner.value_text,
-        status,
-        conflict_values: conflictValues,
-        confidence_score: winner.confidence_score,
-        confidence_band: bandFor(winner.confidence_score),
+        value_numeric: res.value_numeric,
+        value_text: res.value_text,
+        status: res.status,
+        conflict_values: res.conflict_values,
+        confidence_score: winner.confidence,
+        confidence_band: bandFor(winner.confidence),
         source_document_id: srcDoc?.id ?? null,
-        source_location: srcDoc?.name ?? null,
+        source_location: winner.source_location ?? srcDoc?.name ?? null,
         source_text: winner.source_text,
         ai_reasoning: isConflict
-          ? `Conflicting values across documents: ${distinct.join(" vs ")}. Resolve by picking one or using "use conservative" — values are never averaged or blended.`
-          : `${winner.via === "alias" ? "Alias-mapped" : "AI-classified"}: ${winner.reasoning}`,
+          ? `Conflicting values across documents: ${res.distinct.join(" vs ")}. Resolve by picking one or "use conservative" — values are never averaged or blended.`
+          : `Deterministically mapped via alias "${winner.matched_alias}" from ${winner.source_doc_name}.`,
       };
 
       if (prev) {
@@ -356,17 +358,17 @@ export const extractAssumptions = createServerFn({ method: "POST" })
           ...payload, current_version: prev.current_version + 1,
         }).eq("id", prev.id).select().single();
         if (updErr) throw new Error(`Failed to update assumption ${fk}: ${updErr.message}`);
-        if (upd) await recordVersion(context, upd, `Re-extracted via 3-stage pipeline (${status})`, "Extraction Pipeline");
+        if (upd) { await recordVersion(context, upd, `Re-extracted (${res.status})`, "Extraction Pipeline"); updatedAssumptions++; }
       } else {
         const { data: ins, error: insErr } = await context.supabase.from("assumptions").insert(payload).select().single();
         if (insErr) throw new Error(`Failed to insert assumption ${fk}: ${insErr.message}`);
-        if (ins) await recordVersion(context, ins, `Initial extraction (${status})`, "Extraction Pipeline");
+        if (ins) { await recordVersion(context, ins, `Initial extraction (${res.status})`, "Extraction Pipeline"); insertedAssumptions++; }
       }
 
       auditEntries.push({
-        field_key: fk, status,
-        chosen: isConflict ? null : winner.value_numeric ?? winner.value_text,
-        alternates: isConflict ? distinct : undefined,
+        field_key: fk, status: res.status,
+        chosen: isConflict ? null : res.value_numeric ?? res.value_text,
+        alternates: isConflict ? res.distinct : undefined,
         source_doc: winner.source_doc_name,
       });
     }
@@ -377,18 +379,17 @@ export const extractAssumptions = createServerFn({ method: "POST" })
     const calculatedKeys: string[] = [];
     const numericFor = (key: string): number | null => {
       if (conflictKeys.includes(key)) return null;
-      const fromRun = grouped.get(key)?.[0];
-      if (fromRun?.value_numeric != null && !conflictKeys.includes(key)) return fromRun.value_numeric;
+      const fromRun = grouped.get(key);
+      if (fromRun && fromRun.status !== "conflicting" && fromRun.value_numeric != null) return fromRun.value_numeric;
       const prev = existingByKey.get(key);
-      if (prev && prev.status !== "missing" && prev.status !== "rejected" && prev.value_numeric != null) {
-        return Number(prev.value_numeric);
-      }
+      if (prev && prev.status !== "missing" && prev.status !== "rejected" && prev.value_numeric != null) return Number(prev.value_numeric);
       return null;
     };
     const budgetComponentKeys = ["land_cost", "hard_costs", "soft_costs", "contingency", "financing_costs"];
     const budgetComponents = budgetComponentKeys.map((k) => ({ key: k, value: numericFor(k) }));
+    const tdcPrev = existingByKey.get("total_project_cost");
     const tdcAlreadyExtracted = grouped.has("total_project_cost") ||
-      (existingByKey.get("total_project_cost") && !["missing", "rejected"].includes(existingByKey.get("total_project_cost")!.status) && existingByKey.get("total_project_cost")!.status !== "calculated");
+      (tdcPrev && !["missing", "rejected"].includes(tdcPrev.status) && tdcPrev.status !== "calculated");
     if (budgetComponents.every((c) => c.value != null) && !tdcAlreadyExtracted) {
       const total = budgetComponents.reduce((s, c) => s + (c.value ?? 0), 0);
       const fmtMoney = (n: number) => new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(Math.round(n));
@@ -402,9 +403,8 @@ export const extractAssumptions = createServerFn({ method: "POST" })
         confidence_score: 100, confidence_band: "high" as const,
         ai_reasoning: "Calculated deterministically from the five extracted budget lines.",
       };
-      const prevTdc = existingByKey.get("total_project_cost");
-      if (prevTdc) {
-        await context.supabase.from("assumptions").update({ ...payload, current_version: prevTdc.current_version + 1 }).eq("id", prevTdc.id);
+      if (tdcPrev) {
+        await context.supabase.from("assumptions").update({ ...payload, current_version: tdcPrev.current_version + 1 }).eq("id", tdcPrev.id);
       } else {
         await context.supabase.from("assumptions").insert(payload);
       }
@@ -412,7 +412,7 @@ export const extractAssumptions = createServerFn({ method: "POST" })
       auditEntries.push({ field_key: "total_project_cost", status: "calculated", chosen: total });
     }
 
-    // Missing placeholders for every taxonomy key not found
+    // Missing placeholders for every taxonomy key not found / not already present.
     const missingKeys: string[] = [];
     for (const def of ASSUMPTION_DEFS) {
       if (grouped.has(def.key) || existingByKey.has(def.key) || calculatedKeys.includes(def.key)) continue;
@@ -421,14 +421,13 @@ export const extractAssumptions = createServerFn({ method: "POST" })
         project_id: data.project_id, owner_id: context.userId,
         field_key: def.key, field_label: def.label, category: def.category, unit: def.unit,
         status: "missing", confidence_score: 0, confidence_band: "missing",
-        ai_reasoning: "Not found by Stage 1–3 extraction. Provide manually or upload more docs.",
+        ai_reasoning: "Not found by deterministic extraction. Provide manually or upload more docs.",
       }).select().single();
       if (ins) await recordVersion(context, ins, "Created as missing", "Extraction Pipeline");
       auditEntries.push({ field_key: def.key, status: "missing" });
     }
 
-    // The extraction report distinguishes extracted / calculated /
-    // default_accepted / missing tiers.
+    // The extraction report distinguishes extracted / calculated / missing tiers.
     const allMissingKeys = ASSUMPTION_DEFS
       .filter((def) => !grouped.has(def.key) && !calculatedKeys.includes(def.key) &&
         (!existingByKey.has(def.key) || existingByKey.get(def.key)?.status === "missing"))
@@ -440,10 +439,30 @@ export const extractAssumptions = createServerFn({ method: "POST" })
     const satisfiedRequired = new Set(requiredKeysSatisfiedBy(reportMap));
     const missingRequired = REQUIRED_KEYS.filter((key) => !satisfiedRequired.has(key) && allMissingKeys.includes(key));
 
+    const debug = {
+      project_id: data.project_id,
+      documents_seen: docs.length,
+      documents_attempted: perDocument.length,
+      documents_downloaded: documentsDownloaded,
+      documents_failed: perDocument.filter((r) => !r.download_ok).length,
+      per_document: perDocument,
+      total_candidates: allCandidates.length,
+      classified_count: classifiedCount,
+      alias_mapped_count: deterministic.length,
+      mapped_count: mapped.length,
+      grouped_keys: Array.from(grouped.keys()),
+      conflict_keys: conflictKeys,
+      missing_keys: allMissingKeys,
+      inserted_assumptions: insertedAssumptions,
+      updated_assumptions: updatedAssumptions,
+      skipped_docs: skippedDocs,
+      warnings,
+    };
+
     const report = {
       stage1_candidates: allCandidates.length,
-      stage2_classified: classifications.filter((c) => c.field_key !== "ignore").length,
-      stage3_inferred_via_alias: inferredCount,
+      stage2_classified: deterministic.length + classifiedCount,
+      stage3_inferred_via_alias: deterministic.length,
       found: foundKeys.length,
       conflicting: conflictKeys.length,
       calculated: calculatedKeys.length,
@@ -453,6 +472,7 @@ export const extractAssumptions = createServerFn({ method: "POST" })
       conflicts: conflictKeys.map((k) => ASSUMPTION_BY_KEY[k]?.label ?? k),
       can_underwrite: missingRequired.length === 0 && conflictKeys.length === 0,
       entries: auditEntries,
+      debug,
     };
 
     await auditLog(context, data.project_id, "project", data.project_id, "extract_assumptions", report);

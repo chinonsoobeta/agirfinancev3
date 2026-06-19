@@ -51,6 +51,8 @@ async function loadProjectRows(supabase: any, projectId: string): Promise<Projec
       value_numeric: r.value_numeric == null ? null : Number(r.value_numeric),
       status: r.status,
       source: r.source,
+      source_text: r.source_text ?? null,
+      source_location: r.source_location ?? null,
       conflict_values: r.conflict_values ?? null,
     })),
     budget: (budget ?? []).map((r: any) => ({
@@ -106,6 +108,12 @@ function buildReconciliationContext(rows: ProjectInputRows, input: UnderwritingI
   const budgetSum = rows.budget
     .filter((b) => b.status === "approved" || b.status === "default_accepted")
     .reduce((sum, b) => sum + Number(b.amount), 0);
+  const statedTotalRow = rows.scalars.find(
+    (r) => r.key === "stated_total_project_cost" && (r.status === "approved" || r.status === "default_accepted"),
+  );
+  const statedTotalSource = statedTotalRow
+    ? [statedTotalRow.source_location, statedTotalRow.source_text].filter(Boolean).join(" — ").slice(0, 240) || null
+    : null;
   return {
     tdc: output.values.tdc,
     equity: input.equityAmount ?? 0,
@@ -120,6 +128,7 @@ function buildReconciliationContext(rows: ProjectInputRows, input: UnderwritingI
       occupancyPct: r.occupancyPct ?? null,
     })),
     statedTotalProjectCost: scalarValue(rows, "stated_total_project_cost"),
+    statedTotalSource,
     budgetSum,
     unitCounts: [...perUnitCounts, ...(statedUnits != null ? [statedUnits] : [])],
   };

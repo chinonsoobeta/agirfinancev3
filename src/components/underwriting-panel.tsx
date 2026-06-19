@@ -14,11 +14,12 @@ import {
   resolveConflict,
   runFullUnderwriting,
 } from "@/lib/underwriting.functions";
+import { generateMemo, listMemos, debugMemoReadiness } from "@/lib/memo.functions";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Textarea } from "@/components/ui/textarea";
-import { AlertTriangle, ShieldAlert, Info, Calculator, Lock, Scale } from "lucide-react";
+import { AlertTriangle, ShieldAlert, Info, Calculator, Lock, Scale, FileText, Download } from "lucide-react";
 import { toast } from "sonner";
 
 const outputsQ = (pid: string) => queryOptions({ queryKey: ["outputs", pid], queryFn: () => listFinancialOutputs({ data: { project_id: pid } }) });
@@ -27,6 +28,8 @@ const decisionsQ = (pid: string) => queryOptions({ queryKey: ["decisions", pid],
 const auditQ = (pid: string) => queryOptions({ queryKey: ["audit", pid], queryFn: () => listAudit({ data: { project_id: pid } }) });
 const readinessQ = (pid: string) => queryOptions({ queryKey: ["uw-readiness", pid], queryFn: () => getUnderwritingReadiness({ data: { project_id: pid } }) });
 const flagsQ = (pid: string) => queryOptions({ queryKey: ["recon-flags", pid], queryFn: () => listReconciliationFlags({ data: { project_id: pid } }) });
+const memosQ = (pid: string) => queryOptions({ queryKey: ["memos", pid], queryFn: () => listMemos({ data: { project_id: pid } }) });
+const memoDebugQ = (pid: string) => queryOptions({ queryKey: ["memo-debug", pid], queryFn: () => debugMemoReadiness({ data: { project_id: pid } }) });
 
 const SCENARIO_LABELS: Record<string, string> = {
   base: "Base Case", revenue_down: "Revenue Downside (−10%)",
@@ -361,6 +364,8 @@ export function ICPanel({ projectId }: { projectId: string }) {
 
   return (
     <div className="space-y-4">
+      <MemoSection projectId={projectId} />
+
       {flags.filter((f: any) => f.severity === "error").length > 0 && (
         <div className="space-y-2">
           {flags.filter((f: any) => f.severity === "error").map((f: any) => (
@@ -415,6 +420,262 @@ export function ICPanel({ projectId }: { projectId: string }) {
           </ul>
         )}
       </Card>
+    </div>
+  );
+}
+
+const MEMO_SECTIONS: Array<{ key: string; label: string }> = [
+  { key: "executive_summary", label: "Executive Summary" },
+  { key: "project_description", label: "Project Description" },
+  { key: "market_overview", label: "Market Overview" },
+  { key: "development_plan", label: "Development Plan" },
+  { key: "sources_and_uses", label: "Sources & Uses" },
+  { key: "capital_stack", label: "Capital Stack" },
+  { key: "approved_assumptions", label: "Approved Assumptions" },
+  { key: "financial_highlights", label: "Financial Highlights" },
+  { key: "sensitivity", label: "Sensitivity" },
+  { key: "scenario_stress_summary", label: "Scenario / Stress Summary" },
+  { key: "key_risks", label: "Key Risks" },
+  { key: "risk_mitigation", label: "Risk Mitigation" },
+  { key: "reconciliation_flags_summary", label: "Reconciliation Flags" },
+  { key: "investment_recommendation", label: "Investment Recommendation" },
+  { key: "managing_director_verdict", label: "Managing Director Verdict" },
+  { key: "investment_committee_recommendation", label: "IC Recommendation" },
+  { key: "sources_and_assumptions", label: "Sources & Assumptions" },
+];
+
+export function MemoSection({ projectId }: { projectId: string }) {
+  const { data: memos } = useSuspenseQuery(memosQ(projectId));
+  const { data: debug } = useSuspenseQuery(memoDebugQ(projectId));
+  const qc = useQueryClient();
+  const generateMemoFn = useServerFn(generateMemo);
+  const [error, setError] = useState<string | null>(null);
+
+  const gen = useMutation({
+    mutationFn: () => generateMemoFn({ data: { project_id: projectId } }),
+    onMutate: () => setError(null),
+    onSuccess: (row: any) => {
+      qc.invalidateQueries({ queryKey: ["memos", projectId] });
+      qc.invalidateQueries({ queryKey: ["audit", projectId] });
+      qc.invalidateQueries({ queryKey: ["memo-debug", projectId] });
+      const mode = row?.content?.generation_mode ?? (row?.status === "generated_deterministic" ? "deterministic" : "ai");
+      toast.success(mode === "deterministic"
+        ? "No AI key found. Generated deterministic memo instead."
+        : "AI-assisted investment memo generated");
+    },
+    onError: (e: Error) => {
+      // Never swallow the error behind a generic toast — surface it in the UI.
+      console.error("[generateMemo] failed:", e);
+      setError(e.message);
+      toast.error("Memo generation failed — see diagnostics");
+    },
+  });
+
+  const latest: any = memos[0] ?? null;
+  const content = (latest?.content ?? {}) as Record<string, any>;
+  const needsReview = Boolean(latest && (content.needs_review || latest.status === "needs_review" || latest.verification_report?.pass === false));
+  const orphans: any[] = latest?.verification_report?.orphans ?? [];
+
+  const insertFailed = Boolean(error && /saving investment_memos/i.test(error));
+  const provenanceFailed = Boolean(latest && latest.verification_report && latest.verification_report.pass === false);
+
+  return (
+    <Card className="p-5 space-y-3 border-primary/30">
+      <div className="flex items-center justify-between gap-3">
+        <div className="text-[10px] uppercase tracking-widest text-muted-foreground font-semibold">Investment Memo</div>
+        <Button size="sm" onClick={() => gen.mutate()} disabled={!debug.can_generate || gen.isPending}>
+          <FileText className="size-4 mr-1" />{gen.isPending ? "Generating…" : "Generate Memo"}
+        </Button>
+      </div>
+
+      {/* Preconditions */}
+      {!debug.can_generate && (
+        <div className="flex items-start gap-2 text-xs text-chart-5 bg-chart-5/5 border border-chart-5/20 rounded p-3">
+          <AlertTriangle className="size-4 shrink-0 mt-0.5" />
+          <div>
+            <div className="font-semibold uppercase tracking-widest">Cannot generate memo yet</div>
+            <ul className="mt-1 text-muted-foreground list-disc pl-4">
+              {debug.blocking_reasons.map((r: string) => <li key={r}>{r}</li>)}
+            </ul>
+          </div>
+        </div>
+      )}
+      {debug.can_generate && !debug.env.has_anthropic_key && (
+        <div className="flex items-start gap-2 text-xs text-muted-foreground bg-muted/20 border border-border rounded p-3">
+          <Info className="size-4 shrink-0 mt-0.5" />
+          <span>No AI key configured — the memo will be generated from the <strong>deterministic template</strong> (engine outputs + approved assumptions only).</span>
+        </div>
+      )}
+
+      {/* Visible error diagnostics — not swallowed behind a toast */}
+      {error && (
+        <div className="text-xs bg-destructive/5 border border-destructive/30 rounded p-3 space-y-2">
+          <div className="font-semibold uppercase tracking-widest text-destructive">Memo generation error</div>
+          <div className="font-mono text-destructive break-words">{error}</div>
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-x-4 gap-y-1 text-muted-foreground">
+            <Diag label="financial_outputs exist" ok={debug.financial_outputs_count > 0} />
+            <Diag label="cash_flows exist" ok={debug.cash_flows_count > 0} />
+            <Diag label="reconciliation_flags exist" ok={debug.reconciliation_flags_count > 0} />
+            <Diag label="ANTHROPIC_API_KEY configured" ok={debug.env.has_anthropic_key} />
+            <Diag label="investment_memos insert failed" ok={!insertFailed} okLabel={insertFailed ? "yes" : "no"} />
+            <Diag label="provenance verification failed" ok={!provenanceFailed} okLabel={provenanceFailed ? "yes" : "no"} />
+          </div>
+        </div>
+      )}
+
+      {/* needs_review warning */}
+      {needsReview && (
+        <div className="flex items-start gap-2 text-xs text-chart-5 bg-chart-5/5 border border-chart-5/20 rounded p-3">
+          <AlertTriangle className="size-4 shrink-0 mt-0.5" />
+          <span>
+            Memo generated but <strong>requires review</strong> because some numeric tokens lacked provenance
+            {orphans.length > 0 && <> ({orphans.length} orphan token{orphans.length === 1 ? "" : "s"}: {orphans.slice(0, 8).map((o: any) => o.value ?? o).join(", ")})</>}.
+          </span>
+        </div>
+      )}
+
+      {/* Latest memo */}
+      {latest ? (
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+            {(() => {
+              const mode = content.generation_mode ?? (latest.status === "generated_deterministic" ? "deterministic" : "ai");
+              return (
+                <Badge variant="outline" className={`text-[10px] ${mode === "deterministic" ? "text-chart-2 border-chart-2/40" : "text-primary border-primary/40"}`}>
+                  {mode === "deterministic" ? "Deterministic template" : "AI-assisted"}
+                </Badge>
+              );
+            })()}
+            <Badge variant="outline" className="text-[10px] uppercase">{latest.status ?? "generated"}</Badge>
+            <span>{new Date(latest.created_at).toLocaleString()}</span>
+            {content.deterministic_verdict?.code && (
+              <Badge variant="outline" className={`text-[10px] ${content.deterministic_verdict.code === "REJECT" ? "text-destructive border-destructive/40" : "text-primary border-primary/40"}`}>
+                {content.deterministic_verdict.code}
+              </Badge>
+            )}
+            <div className="ml-auto flex gap-1.5">
+              <Button size="sm" variant="outline" disabled={!content.report} onClick={() => downloadMemo("pdf", content.report)}>
+                <Download className="size-3.5 mr-1" />PDF
+              </Button>
+              <Button size="sm" variant="outline" disabled={!content.report} onClick={() => downloadMemo("docx", content.report)}>
+                <Download className="size-3.5 mr-1" />DOCX
+              </Button>
+            </div>
+          </div>
+
+          {content.report
+            ? <MemoReportView report={content.report} />
+            : MEMO_SECTIONS.filter((s) => typeof content[s.key] === "string" && content[s.key]).map((s) => (
+                <div key={s.key}>
+                  <div className="text-[10px] uppercase tracking-widest text-muted-foreground font-semibold">{s.label}</div>
+                  <p className="text-sm mt-1 whitespace-pre-wrap">{content[s.key]}</p>
+                </div>
+              ))}
+        </div>
+      ) : (
+        <p className="text-sm text-muted-foreground">No memo yet. Run deterministic underwriting, then generate the memo.</p>
+      )}
+
+      {/* Dev-only readiness debug */}
+      {import.meta.env.DEV && (
+        <details className="text-[10px]">
+          <summary className="cursor-pointer text-muted-foreground uppercase tracking-widest">Memo readiness debug</summary>
+          <pre className="mt-2 overflow-x-auto bg-muted/30 rounded p-2 font-mono">{JSON.stringify(debug, null, 2)}</pre>
+        </details>
+      )}
+    </Card>
+  );
+}
+
+function Diag({ label, ok, okLabel }: { label: string; ok: boolean; okLabel?: string }) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <span className={ok ? "text-success" : "text-destructive"}>{okLabel ?? (ok ? "yes" : "no")}</span>
+      <span>{label}</span>
+    </div>
+  );
+}
+
+async function downloadMemo(kind: "pdf" | "docx", report: any) {
+  if (!report) return;
+  const safe = String(report.project_name ?? "Investment").replace(/[^\w]+/g, "_");
+  try {
+    if (kind === "pdf") {
+      const { downloadMemoPdf } = await import("@/lib/memo-pdf");
+      await downloadMemoPdf(report, `${safe}_Investment_Memo.pdf`);
+    } else {
+      const { downloadMemoDocx } = await import("@/lib/memo-docx");
+      await downloadMemoDocx(report, `${safe}_Investment_Memo.docx`);
+    }
+  } catch (e) {
+    console.error("[memo download] failed:", e);
+    toast.error(`Download failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+// On-screen rendering of the structured memo report — mirrors the PDF/DOCX.
+function MemoReportView({ report }: { report: any }) {
+  const isReject = report.verdict_code === "REJECT";
+  return (
+    <div className="space-y-4 rounded border border-border bg-background/40 p-4">
+      <div>
+        <div className="text-lg font-semibold">{report.title}</div>
+        <div className="text-primary font-medium">{report.project_name}</div>
+        <div className="text-xs text-muted-foreground">{report.subtitle} · {report.mode_label}</div>
+      </div>
+
+      {report.summary_stats?.length > 0 && (
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+          {report.summary_stats.map((s: any) => (
+            <div key={s.label} className="rounded border border-border p-2">
+              <div className="text-[9px] uppercase tracking-widest text-muted-foreground">{s.label}</div>
+              <div className="num text-sm">{s.value}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className={`rounded px-3 py-2 text-sm font-semibold text-white ${isReject ? "bg-destructive" : report.verdict_code === "APPROVE" ? "bg-success" : "bg-chart-5"}`}>
+        {report.verdict_banner}
+      </div>
+      {report.verdict_narrative && <p className="text-sm text-muted-foreground">{report.verdict_narrative}</p>}
+
+      {report.metric_cards?.length > 0 && (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+          {report.metric_cards.map((c: any) => (
+            <div key={c.label} className="rounded border border-border p-2">
+              <div className="text-[9px] uppercase tracking-widest text-muted-foreground">{c.label}</div>
+              <div className="num text-base">{c.value}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {report.sections?.map((sec: any, i: number) => (
+        <div key={sec.heading}>
+          <div className="text-[10px] uppercase tracking-widest text-muted-foreground font-semibold mb-1">{i + 1}. {sec.heading}</div>
+          {sec.table && (
+            <div className="overflow-x-auto">
+              <table className="data-grid w-full text-xs">
+                <thead><tr className="bg-muted/20">{sec.table.columns.map((c: string) => <th key={c} className="text-left">{c}</th>)}</tr></thead>
+                <tbody>
+                  {sec.table.rows.map((r: string[], ri: number) => (
+                    <tr key={ri}>{r.map((cell, ci) => <td key={ci} className={ci === 0 ? "font-medium" : "num"}>{cell}</td>)}</tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {sec.body && <p className="text-sm whitespace-pre-wrap">{sec.body}</p>}
+          {sec.table?.note && <p className="text-[10px] italic text-muted-foreground mt-1">Note: {sec.table.note}</p>}
+        </div>
+      ))}
+
+      {report.footnotes?.length > 0 && (
+        <div className="border-t border-border pt-2 space-y-1">
+          {report.footnotes.map((f: string, i: number) => <p key={i} className="text-[10px] text-muted-foreground">{f}</p>)}
+        </div>
+      )}
     </div>
   );
 }

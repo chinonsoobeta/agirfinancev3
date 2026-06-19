@@ -6,9 +6,14 @@ DECLARE
   owner UUID := '00000000-0000-0000-0000-000000000000';
   project UUID := '11111111-1111-1111-1111-111111111111';
 BEGIN
+  -- The token columns must be '' (not NULL): GoTrue scans them into Go strings
+  -- and a NULL fails with "converting NULL to string is unsupported" at sign-in.
   INSERT INTO auth.users (
     instance_id, id, aud, role, email, encrypted_password, email_confirmed_at,
-    raw_app_meta_data, raw_user_meta_data, created_at, updated_at
+    raw_app_meta_data, raw_user_meta_data, created_at, updated_at,
+    confirmation_token, recovery_token, email_change,
+    email_change_token_new, email_change_token_current,
+    phone_change, phone_change_token, reauthentication_token
   ) VALUES (
     '00000000-0000-0000-0000-000000000000', owner, 'authenticated', 'authenticated',
     'maple.heights@example.com',
@@ -17,8 +22,18 @@ BEGIN
     '{"provider":"email","providers":["email"]}'::jsonb,
     '{"full_name":"Maple Heights Demo"}'::jsonb,
     now(),
-    now()
+    now(),
+    '', '', '', '', '', '', '', ''
   ) ON CONFLICT (id) DO NOTHING;
+
+  -- GoTrue requires a matching identity row for password sign-in.
+  INSERT INTO auth.identities (
+    provider_id, user_id, identity_data, provider, last_sign_in_at, created_at, updated_at
+  ) VALUES (
+    owner::text, owner,
+    jsonb_build_object('sub', owner::text, 'email', 'maple.heights@example.com', 'email_verified', true),
+    'email', now(), now(), now()
+  ) ON CONFLICT (provider_id, provider) DO NOTHING;
 
   INSERT INTO public.projects (
     id, owner_id, name, location, type, status, deal_type,
@@ -33,6 +48,7 @@ BEGIN
     (project, owner, 'land', 'Land', 8500000, 'analyst'),
     (project, owner, 'hard', 'Hard Costs', 28000000, 'analyst'),
     (project, owner, 'soft', 'Soft Costs', 4000000, 'analyst'),
+    (project, owner, 'contingency', 'Contingency', 0, 'analyst'),
     (project, owner, 'financing_interest', 'Financing Interest', 2000000, 'analyst')
   ON CONFLICT DO NOTHING;
 
@@ -60,4 +76,18 @@ BEGIN
     (project, owner, 'rent_growth_pct', 0, 'default'),
     (project, owner, 'expense_growth_pct', 0, 'default')
   ON CONFLICT (project_id, key) DO NOTHING;
+
+  -- Make the golden fixture engine-readable. The fail-closed loader selects only
+  -- status IN ('approved','default_accepted'); the migration backfill ran before
+  -- this seed, so without these updates every row stays 'extracted' and
+  -- underwriting is blocked. Analyst values -> approved; defaults -> accepted.
+  UPDATE public.development_budget SET status = 'approved' WHERE project_id = project;
+  UPDATE public.revenue_program SET status = 'approved' WHERE project_id = project;
+  UPDATE public.underwriting_inputs
+    SET status = CASE WHEN source = 'analyst'
+                      THEN 'approved'::public.engine_input_status
+                      ELSE 'default_accepted'::public.engine_input_status END,
+        approved_by = CASE WHEN source = 'analyst' THEN owner ELSE NULL END,
+        approved_at = now()
+    WHERE project_id = project;
 END $$;

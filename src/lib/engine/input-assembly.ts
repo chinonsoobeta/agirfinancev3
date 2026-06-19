@@ -25,6 +25,8 @@ export type ScalarInputRow = {
   value_numeric: number | null;
   status: EngineInputStatus;
   source?: string | null;
+  source_text?: string | null;
+  source_location?: string | null;
   conflict_values?: { value: number; source?: string | null }[] | null;
 };
 
